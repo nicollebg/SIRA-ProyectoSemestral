@@ -1,46 +1,374 @@
 """
 seed.py
-Carga los datos iniciales (grupos y usuarios de prueba) la primera vez
-que se ejecuta la aplicación, para que quede lista para usar de inmediato.
+
+Carga los datos iniciales de SIRA.
 """
 
+from datetime import datetime
+
+from sqlalchemy import select
+
+from database import SessionLocal
+
+from models import (
+    Student,
+    Teacher,
+    Subject,
+    Group,
+)
+
 from security import hash_password
-from models import Grupo, Usuario
 
-GRUPOS_INICIALES = [
-    # materia, grupo, docente, horario, cupos_totales, cupos_ocupados
-    ("Bases de Datos II", "A", "M. Rojas", "Lun/Mié 8:00-10:00", 30, 12),
-    ("Ingeniería de Software", "B", "C. Peña", "Mar/Jue 10:00-12:00", 30, 27),
-    ("Redes de Computadores", "A", "L. Gómez", "Vie 7:00-11:00", 30, 30),
-    ("Estructuras de Datos", "C", "A. Torres", "Lun/Mié 14:00-16:00", 30, 12),
-    ("Sistemas Operativos", "A", "J. Ibarra", "Mar/Jue 16:00-18:00", 30, 30),
+
+# ============================================================
+# DOCENTES Y MATERIAS
+# ============================================================
+
+MATERIAS = [
+
+    (
+        "BD2",
+        "Bases de Datos II",
+        4,
+        "M.",
+        "Rojas"
+    ),
+
+    (
+        "IS1",
+        "Ingeniería de Software",
+        4,
+        "C.",
+        "Peña"
+    ),
+
+    (
+        "RC1",
+        "Redes de Computadores",
+        4,
+        "L.",
+        "Gómez"
+    ),
+
+    (
+        "ED1",
+        "Estructuras de Datos",
+        3,
+        "A.",
+        "Torres"
+    ),
+
+    (
+        "SO1",
+        "Sistemas Operativos",
+        4,
+        "J.",
+        "Ibarra"
+    ),
 ]
 
-# Credenciales de prueba (se muestran también en el README)
-USUARIOS_INICIALES = [
-    # correo, password, nombre, rol
-    ("nbarrera@umb.edu.co", "estudiante123", "Nicolle Barrera", "estudiante"),
-    ("mquesada@umb.edu.co", "estudiante123", "Mateo Quesada", "estudiante"),
-    ("dcardenas@umb.edu.co", "estudiante123", "Diana Cardenas", "estudiante"),
-    ("cpena@umb.edu.co", "coordinador123", "C. Peña", "coordinador"),
+
+# ============================================================
+# GRUPOS
+# ============================================================
+
+GRUPOS = [
+
+    (
+        0,
+        "A",
+        "Lun/Mié 8:00-10:00",
+        30,
+        12
+    ),
+
+    (
+        1,
+        "B",
+        "Mar/Jue 10:00-12:00",
+        30,
+        27
+    ),
+
+    (
+        2,
+        "A",
+        "Vie 7:00-11:00",
+        30,
+        30
+    ),
+
+    (
+        3,
+        "C",
+        "Lun/Mié 14:00-16:00",
+        30,
+        12
+    ),
+
+    (
+        4,
+        "A",
+        "Mar/Jue 16:00-18:00",
+        30,
+        30
+    ),
 ]
 
 
-def seed_if_empty(session_factory):
-    """Inserta datos de ejemplo solo si las tablas están vacías (no duplica en reinicios)."""
+# ============================================================
+# USUARIOS
+# ============================================================
+
+USUARIOS = [
+
+    (
+        "NB-001",
+        "Nicolle Barrera",
+        "nbarrera@umb.edu.co",
+        "estudiante123"
+    ),
+
+    (
+        "MQ-002",
+        "Mateo Quesada",
+        "mquesada@umb.edu.co",
+        "estudiante123"
+    ),
+
+    (
+        "DC-003",
+        "Diana Cardenas",
+        "dcardenas@umb.edu.co",
+        "estudiante123"
+    ),
+
+    (
+        "COORD-001",
+        "C. Peña",
+        "cpena@umb.edu.co",
+        "coordinador123"
+    ),
+]
+
+
+# ============================================================
+# SEED
+# ============================================================
+
+def seed_if_empty(
+    session_factory=SessionLocal
+):
+
     with session_factory() as session:
-        if session.query(Grupo).count() == 0:
-            for materia, grupo, docente, horario, total, ocupados in GRUPOS_INICIALES:
-                session.add(Grupo(
-                    materia=materia, grupo=grupo, docente=docente, horario=horario,
-                    cupos_totales=total, cupos_ocupados=ocupados,
-                ))
 
-        if session.query(Usuario).count() == 0:
-            for correo, password, nombre, rol in USUARIOS_INICIALES:
-                session.add(Usuario(
-                    correo=correo, password_hash=hash_password(password),
-                    nombre=nombre, rol=rol,
-                ))
+        # ----------------------------------------------------
+        # DOCENTES
+        # ----------------------------------------------------
+
+        docentes = []
+
+        for indice, materia in enumerate(
+            MATERIAS,
+            start=1
+        ):
+
+            codigo = materia[0]
+            nombre_materia = materia[1]
+            nombre = materia[3]
+            apellido = materia[4]
+
+            correo = (
+                f"{nombre.lower()}"
+                f".{apellido.lower()}"
+                "@umb.edu.co"
+            )
+
+            docente = session.scalar(
+
+                select(Teacher)
+
+                .where(
+                    Teacher.email
+                    == correo
+                )
+            )
+
+            if docente is None:
+
+                docente = Teacher(
+
+                    document=
+                        f"DOC-{indice:03d}",
+
+                    name=nombre,
+
+                    last_name=apellido,
+
+                    email=correo,
+
+                    phone="",
+
+                    status=True
+                )
+
+                session.add(
+                    docente
+                )
+
+                session.flush()
+
+            docentes.append(
+                docente
+            )
+
+        # ----------------------------------------------------
+        # MATERIAS
+        # ----------------------------------------------------
+
+        materias = []
+
+        for indice, materia in enumerate(
+            MATERIAS
+        ):
+
+            codigo = materia[0]
+            nombre = materia[1]
+            semestre = materia[2]
+
+            subject = session.scalar(
+
+                select(Subject)
+
+                .where(
+                    Subject.code
+                    == codigo
+                )
+
+            )
+
+            if subject is None:
+
+                subject = Subject(
+
+                    code=codigo,
+
+                    name=nombre,
+
+                    semester=semestre,
+
+                    teacher_id=
+                        docentes[indice]
+                        .teacher_id,
+
+                    status=True
+                )
+
+                session.add(
+                    subject
+                )
+
+                session.flush()
+
+            materias.append(
+                subject
+            )
+
+        # ----------------------------------------------------
+        # GRUPOS
+        # ----------------------------------------------------
+
+        existe_grupo = session.scalar(
+
+            select(
+                Group.group_id
+            )
+
+            .limit(1)
+
+        )
+
+        if existe_grupo is None:
+
+            for (
+                indice,
+                nombre_grupo,
+                horario,
+                cupo_maximo,
+                cupo_actual
+            ) in GRUPOS:
+
+                session.add(
+
+                    Group(
+
+                        subject_id=
+                            materias[indice]
+                            .subject_id,
+
+                        academic_period=
+                            "2026-2",
+
+                        schedule=
+                            horario,
+
+                        maximum_capacity=
+                            cupo_maximo,
+
+                        current_capacity=
+                            cupo_actual,
+
+                        lock_version=0,
+
+                        status=True
+                    )
+                )
+
+        # ----------------------------------------------------
+        # USUARIOS
+        # ----------------------------------------------------
+
+        for (
+            codigo,
+            nombre,
+            correo,
+            password
+        ) in USUARIOS:
+
+            usuario = session.scalar(
+
+                select(Student)
+
+                .where(
+                    Student.email
+                    == correo
+                )
+
+            )
+
+            if usuario is None:
+
+                usuario = Student(
+
+                    code=codigo,
+
+                    name=nombre,
+
+                    email=correo,
+
+                    password=
+                        hash_password(
+                            password
+                        ),
+
+                    registration_date=
+                        datetime.utcnow(),
+
+                    status=True
+                )
+
+                session.add(
+                    usuario
+                )
 
         session.commit()

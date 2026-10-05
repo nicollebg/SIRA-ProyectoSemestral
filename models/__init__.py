@@ -7,3 +7,15 @@ from models.waitlist import Waitlist
 from models.notification import Notification
 from models.coordinator import Coordinator
 from models.performanceMetric import PerformanceMetric
+
+__all__ = [
+    "Student",
+    "Teacher",
+    "Subject",
+    "Group",
+    "Enrollment",
+    "Waitlist",
+    "Notification",
+    "Coordinator",
+    "PerformanceMetric",
+]

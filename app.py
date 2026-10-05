@@ -1,14 +1,6 @@
 """
 SIRA - Sistema de Registro Académico
-Front-end (Streamlit) - mismo diseño visual definido previamente:
-topbar azul marino, tarjetas blancas, pills de estado por colores,
-pantallas de login, catálogo, confirmación de inscripción, lista de
-espera y panel del coordinador, más el simulador de concurrencia.
 
-Ahora conectado a una base de datos real (ver database.py / services.py):
-- Autenticación contra usuarios guardados en la BD (contraseñas con hash).
-- Inscripciones, cancelaciones y lista de espera persistentes.
-- Bloqueo de registros con reintentos reales ante inscripciones concurrentes.
 
 Para ejecutarlo:
     pip install -r requirements.txt
@@ -21,7 +13,8 @@ import time
 import pandas as pd
 import streamlit as st
 
-from database import init_db
+from database import init_db, SessionLocal
+from seed import seed_if_empty
 import services
 from services import ErrorConcurrencia, ErrorValidacion
 
@@ -447,8 +440,16 @@ def pantalla_simulador():
 # =============================================================================
 
 def main():
-    st.set_page_config(page_title="SIRA - Registro Académico", layout="wide")
+    st.set_page_config(
+        page_title="SIRA - Registro Académico",
+        layout="wide"
+    )
+
     init_db()
+
+    # Carga los datos de prueba si todavía no existen
+    seed_if_empty(SessionLocal)
+
     inject_css()
     init_session_state()
 

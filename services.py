@@ -1,21 +1,12 @@
 """
 services.py
-Toda la lógica de negocio del sistema. Cada función aquí es la que
-"hace funcionar de verdad" cada botón y pantalla de la interfaz (app.py).
-
-Puntos clave de la implementación:
-- inscribir_estudiante() usa una transacción exclusiva por grupo
-  (BEGIN IMMEDIATE en SQLite / SELECT ... FOR UPDATE en MySQL) para que
-  dos estudiantes NUNCA puedan tomar el mismo cupo al mismo tiempo.
-- Si la base de datos está ocupada por otra transacción concurrente,
-  la operación se reintenta automáticamente (con backoff) hasta
-  MAX_REINTENTOS veces, y cada intento se registra en las métricas.
-- cancelar_inscripcion() libera el cupo y lo asigna automáticamente
-  al primer estudiante de la lista de espera, generándole una notificación.
+Lógica de negocio del sistema SIRA.
+Compatible con los modelos SQLAlchemy actuales.
 """
 
 import random
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
 
@@ -23,404 +14,1264 @@ from sqlalchemy import delete, func, insert, select, update
 from sqlalchemy.exc import OperationalError
 
 from database import engine, SessionLocal
+
 from models import (
-    Grupo, Inscripcion, ListaEspera, MetricaTransaccion, Notificacion, Usuario,
+    Student,
+    Teacher,
+    Subject,
+    Group,
+    Enrollment,
+    Waitlist,
+    Notification,
+    PerformanceMetric,
 )
+
 from security import hash_password, verify_password
+
 
 MAX_REINTENTOS = 5
 
 
+# ============================================================
+# ERRORES
+# ============================================================
+
 class ErrorValidacion(Exception):
-    """Error de validación de datos de entrada, para mostrar en la interfaz."""
+    """Error de validación que se muestra en la interfaz."""
+    pass
 
 
 class ErrorConcurrencia(Exception):
-    """No se pudo completar la operación tras varios reintentos por alta concurrencia."""
+    """Error producido por demasiadas operaciones concurrentes."""
+    pass
 
 
-# =============================================================================
-# AUTENTICACIÓN (pantalla de login)
-# =============================================================================
+# ============================================================
+# USUARIO DE SESIÓN
+# ============================================================
 
-def autenticar(correo: str, password: str) -> Usuario:
-    """Valida el formulario de login y verifica las credenciales contra la BD."""
+@dataclass
+class UsuarioSesion:
+    """
+    Objeto utilizado por app.py para conservar la sesión.
+    No es una tabla de la base de datos.
+    """
+
+    id: int
+    nombre: str
+    correo: str
+    rol: str
+    password_hash: str = ""
+
+
+# ============================================================
+# AUTENTICACIÓN
+# ============================================================
+
+def autenticar(correo: str, password: str) -> UsuarioSesion:
+
     correo = (correo or "").strip().lower()
     password = password or ""
 
     if not correo:
-        raise ErrorValidacion("Ingresa tu usuario institucional.")
+        raise ErrorValidacion(
+            "Ingresa tu usuario institucional."
+        )
+
     if "@" not in correo or "." not in correo.split("@")[-1]:
-        raise ErrorValidacion("El usuario institucional debe ser un correo válido.")
+        raise ErrorValidacion(
+            "El usuario institucional debe ser un correo válido."
+        )
+
     if not password:
-        raise ErrorValidacion("Ingresa tu contraseña.")
+        raise ErrorValidacion(
+            "Ingresa tu contraseña."
+        )
 
     with SessionLocal() as session:
-        usuario = session.scalar(select(Usuario).where(Usuario.correo == correo))
-        if usuario is None or not verify_password(password, usuario.password_hash):
-            raise ErrorValidacion("Usuario o contraseña incorrectos.")
-        session.expunge(usuario)
-        return usuario
+
+        usuario = session.scalar(
+            select(Student).where(
+                Student.email == correo
+            )
+        )
+
+        if usuario is None:
+            raise ErrorValidacion(
+                "Usuario o contraseña incorrectos."
+            )
+
+        if not verify_password(
+            password,
+            usuario.password
+        ):
+            raise ErrorValidacion(
+                "Usuario o contraseña incorrectos."
+            )
+
+        if not usuario.status:
+            raise ErrorValidacion(
+                "El usuario está inactivo."
+            )
+
+        # Los coordinadores de prueba tienen código COORD-...
+        if (usuario.code or "").startswith("COORD-"):
+            rol = "coordinador"
+        else:
+            rol = "estudiante"
+
+        return UsuarioSesion(
+            id=usuario.student_id,
+            nombre=usuario.name,
+            correo=usuario.email,
+            rol=rol,
+            password_hash=usuario.password,
+        )
 
 
-# =============================================================================
-# CATÁLOGO DE MATERIAS Y GRUPOS
-# =============================================================================
+# ============================================================
+# CATÁLOGO
+# ============================================================
 
-def listar_grupos(filtro_texto: str = "") -> list[dict]:
-    """Devuelve los grupos (con cupos y estado calculados) para la pantalla de catálogo."""
+def _fila_grupo(
+    grupo: Group,
+    espera: int = 0
+) -> dict:
+
+    if grupo.subject:
+
+        materia = grupo.subject.name
+
+    else:
+
+        materia = "Materia sin nombre"
+
+    docente = "Sin docente"
+
+    if grupo.subject and grupo.subject.teacher:
+
+        docente = (
+            f"{grupo.subject.teacher.name} "
+            f"{grupo.subject.teacher.last_name}"
+        ).strip()
+
+    disponibles = max(
+        0,
+        grupo.maximum_capacity - grupo.current_capacity
+    )
+
+    if disponibles <= 0:
+
+        estado = "Sin cupos"
+        estado_coordinador = "Lleno"
+
+    elif disponibles <= 3:
+
+        estado = "Pocos cupos"
+        estado_coordinador = "Casi lleno"
+
+    else:
+
+        estado = "Disponible"
+        estado_coordinador = "Normal"
+
+    return {
+        "id": grupo.group_id,
+        "materia": materia,
+        "grupo": grupo.group_id,
+        "docente": docente,
+        "horario": grupo.schedule,
+        "cupos_totales": grupo.maximum_capacity,
+        "cupos_ocupados": grupo.current_capacity,
+        "cupos_disponibles": disponibles,
+        "en_espera": espera,
+        "estado": estado,
+        "estado_coordinador": estado_coordinador,
+    }
+
+
+def listar_grupos(
+    filtro_texto: str = ""
+) -> list[dict]:
+
     with SessionLocal() as session:
-        grupos = session.scalars(select(Grupo).order_by(Grupo.materia, Grupo.grupo)).all()
 
-        conteos_espera = dict(session.execute(
-            select(ListaEspera.grupo_id, func.count(ListaEspera.id))
-            .where(ListaEspera.activo.is_(True))
-            .group_by(ListaEspera.grupo_id)
-        ).all())
+        grupos = session.scalars(
+            select(Group)
+            .order_by(
+                Group.subject_id,
+                Group.group_id
+            )
+        ).all()
 
         resultado = []
-        for g in grupos:
-            if filtro_texto and filtro_texto.lower() not in g.materia.lower():
-                continue
-            disponibles = g.cupos_totales - g.cupos_ocupados
-            if disponibles <= 0:
-                estado, estado_coordinador = "Sin cupos", "Lleno"
-            elif disponibles <= 3:
-                estado, estado_coordinador = "Pocos cupos", "Casi lleno"
-            else:
-                estado, estado_coordinador = "Disponible", "Normal"
 
-            resultado.append({
-                "id": g.id, "materia": g.materia, "grupo": g.grupo, "docente": g.docente,
-                "horario": g.horario, "cupos_totales": g.cupos_totales,
-                "cupos_ocupados": g.cupos_ocupados, "cupos_disponibles": disponibles,
-                "en_espera": conteos_espera.get(g.id, 0),
-                "estado": estado, "estado_coordinador": estado_coordinador,
-            })
+        for grupo in grupos:
+
+            materia = (
+                grupo.subject.name
+                if grupo.subject
+                else ""
+            )
+
+            if (
+                filtro_texto
+                and filtro_texto.lower()
+                not in materia.lower()
+            ):
+                continue
+
+            espera = session.scalar(
+                select(
+                    func.count(
+                        Waitlist.waitlist_id
+                    )
+                ).where(
+                    Waitlist.group_id == grupo.group_id,
+                    Waitlist.status.is_(True)
+                )
+            ) or 0
+
+            resultado.append(
+                _fila_grupo(
+                    grupo,
+                    espera
+                )
+            )
+
         return resultado
 
 
-def obtener_grupo(grupo_id: int) -> Optional[dict]:
-    for g in listar_grupos():
-        if g["id"] == grupo_id:
-            return g
-    return None
+def obtener_grupo(
+    grupo_id: int
+) -> Optional[dict]:
+
+    with SessionLocal() as session:
+
+        grupo = session.get(
+            Group,
+            grupo_id
+        )
+
+        if grupo is None:
+            return None
+
+        espera = session.scalar(
+            select(
+                func.count(
+                    Waitlist.waitlist_id
+                )
+            ).where(
+                Waitlist.group_id == grupo_id,
+                Waitlist.status.is_(True)
+            )
+        ) or 0
+
+        return _fila_grupo(
+            grupo,
+            espera
+        )
 
 
-# =============================================================================
-# INSCRIPCIÓN (transaccional, con bloqueo de registros y reintentos)
-# =============================================================================
+# ============================================================
+# TRANSACCIONES
+# ============================================================
 
 def _iniciar_transaccion_exclusiva(conn):
-    """Abre una transacción que bloquea escrituras concurrentes sobre la BD."""
-    if engine.dialect.name == "sqlite":
-        conn.exec_driver_sql("BEGIN IMMEDIATE")
-    else:  # MySQL / MariaDB / Postgres
-        conn.exec_driver_sql("START TRANSACTION")
 
-
-def _leer_grupo_bloqueado(conn, grupo_id: int):
-    """Lee la fila del grupo bloqueándola para evitar que otra transacción la modifique."""
     if engine.dialect.name == "sqlite":
-        # SQLite ya bloqueó toda la base de datos con BEGIN IMMEDIATE.
-        fila = conn.execute(
-            select(Grupo.cupos_totales, Grupo.cupos_ocupados).where(Grupo.id == grupo_id)
-        ).first()
+
+        conn.exec_driver_sql(
+            "BEGIN IMMEDIATE"
+        )
+
     else:
-        # SELECT ... FOR UPDATE: bloqueo real a nivel de fila en MySQL/Postgres.
-        fila = conn.execute(
-            select(Grupo.cupos_totales, Grupo.cupos_ocupados)
-            .where(Grupo.id == grupo_id)
-            .with_for_update()
-        ).first()
+
+        conn.exec_driver_sql(
+            "START TRANSACTION"
+        )
+
+
+def _leer_grupo_bloqueado(
+    conn,
+    grupo_id: int
+):
+
+    consulta = (
+        select(
+            Group.group_id,
+            Group.maximum_capacity,
+            Group.current_capacity
+        )
+        .where(
+            Group.group_id == grupo_id
+        )
+    )
+
+    if engine.dialect.name != "sqlite":
+
+        consulta = consulta.with_for_update()
+
+    fila = conn.execute(
+        consulta
+    ).first()
+
     if fila is None:
-        raise ErrorValidacion("El grupo seleccionado no existe.")
+
+        raise ErrorValidacion(
+            "El grupo seleccionado no existe."
+        )
+
     return fila
 
 
-def _registrar_metrica(grupo_id: int, resultado: str, tiempo_ms: float, reintentos: int):
+# ============================================================
+# MÉTRICAS
+# ============================================================
+
+def _registrar_metrica(
+    grupo_id: int,
+    resultado: str,
+    tiempo_ms: float,
+    reintentos: int
+):
+
     with SessionLocal() as session:
-        session.add(MetricaTransaccion(
-            grupo_id=grupo_id, resultado=resultado,
-            tiempo_respuesta_ms=tiempo_ms, reintentos=reintentos,
-        ))
+
+        session.add(
+            PerformanceMetric(
+                group_reference_id=grupo_id,
+                event_timestamp=datetime.utcnow(),
+                response_time_ms=int(tiempo_ms),
+                successful_transactions=(
+                    1
+                    if resultado in {
+                        "inscrito",
+                        "ya_inscrito",
+                        "lista_espera",
+                        "ya_en_espera"
+                    }
+                    else 0
+                ),
+                failed_transactions=(
+                    1
+                    if resultado == "fallida"
+                    else 0
+                ),
+                retried_transactions=reintentos,
+            )
+        )
+
         session.commit()
 
 
-def _intentar_inscripcion(usuario_id: int, grupo_id: int) -> str:
-    """Un único intento de inscripción, dentro de una transacción exclusiva."""
-    conn = engine.connect().execution_options(isolation_level="AUTOCOMMIT")
+# ============================================================
+# UNA INSCRIPCIÓN
+# ============================================================
+
+def _intentar_inscripcion(
+    usuario_id: int,
+    grupo_id: int
+) -> str:
+
+    conn = engine.connect()
+
     try:
-        _iniciar_transaccion_exclusiva(conn)
+
+        _iniciar_transaccion_exclusiva(
+            conn
+        )
+
+        # ----------------------------------------------------
+        # ¿YA ESTÁ INSCRITO?
+        # ----------------------------------------------------
 
         ya_inscrito = conn.execute(
-            select(Inscripcion.id).where(
-                Inscripcion.usuario_id == usuario_id,
-                Inscripcion.grupo_id == grupo_id,
-                Inscripcion.estado == "activa",
+
+            select(
+                Enrollment.enrollment_id
             )
+
+            .where(
+                Enrollment.student_id == usuario_id,
+                Enrollment.group_id == grupo_id,
+                Enrollment.status.is_(True)
+            )
+
         ).first()
+
         if ya_inscrito:
-            conn.exec_driver_sql("COMMIT")
+
+            conn.exec_driver_sql(
+                "COMMIT"
+            )
+
             return "ya_inscrito"
 
-        grupo = _leer_grupo_bloqueado(conn, grupo_id)
+        # ----------------------------------------------------
+        # BLOQUEAR GRUPO
+        # ----------------------------------------------------
 
-        if grupo.cupos_ocupados < grupo.cupos_totales:
+        grupo = _leer_grupo_bloqueado(
+            conn,
+            grupo_id
+        )
+
+        # ----------------------------------------------------
+        # HAY CUPO
+        # ----------------------------------------------------
+
+        if (
+            grupo.current_capacity
+            < grupo.maximum_capacity
+        ):
+
             conn.execute(
-                update(Grupo).where(Grupo.id == grupo_id)
-                .values(cupos_ocupados=Grupo.cupos_ocupados + 1)
+
+                update(Group)
+
+                .where(
+                    Group.group_id == grupo_id
+                )
+
+                .values(
+                    current_capacity=
+                    Group.current_capacity + 1
+                )
             )
-            conn.execute(insert(Inscripcion).values(
-                usuario_id=usuario_id, grupo_id=grupo_id,
-                estado="activa", fecha=datetime.utcnow(),
-            ))
-            conn.exec_driver_sql("COMMIT")
+
+            conn.execute(
+
+                insert(Enrollment)
+
+                .values(
+                    student_id=usuario_id,
+                    group_id=grupo_id,
+                    enrollment_date=datetime.utcnow(),
+                    period="2026-2",
+                    status=True
+                )
+            )
+
+            conn.exec_driver_sql(
+                "COMMIT"
+            )
+
             return "inscrito"
 
-        ya_en_espera = conn.execute(
-            select(ListaEspera.id).where(
-                ListaEspera.usuario_id == usuario_id,
-                ListaEspera.grupo_id == grupo_id,
-                ListaEspera.activo.is_(True),
+        # ----------------------------------------------------
+        # ¿YA ESTÁ EN LISTA DE ESPERA?
+        # ----------------------------------------------------
+
+        ya_espera = conn.execute(
+
+            select(
+                Waitlist.waitlist_id
             )
+
+            .where(
+                Waitlist.student_id == usuario_id,
+                Waitlist.group_id == grupo_id,
+                Waitlist.status.is_(True)
+            )
+
         ).first()
-        if ya_en_espera:
-            conn.exec_driver_sql("COMMIT")
+
+        if ya_espera:
+
+            conn.exec_driver_sql(
+                "COMMIT"
+            )
+
             return "ya_en_espera"
 
-        conn.execute(insert(ListaEspera).values(
-            usuario_id=usuario_id, grupo_id=grupo_id,
-            activo=True, fecha_ingreso=datetime.utcnow(),
-        ))
-        conn.exec_driver_sql("COMMIT")
+        # ----------------------------------------------------
+        # NUEVA POSICIÓN
+        # ----------------------------------------------------
+
+        posicion = conn.execute(
+
+            select(
+                func.count(
+                    Waitlist.waitlist_id
+                )
+            )
+
+            .where(
+                Waitlist.group_id == grupo_id,
+                Waitlist.status.is_(True)
+            )
+
+        ).scalar_one() + 1
+
+        conn.execute(
+
+            insert(Waitlist)
+
+            .values(
+                student_id=usuario_id,
+                group_id=grupo_id,
+                position=posicion,
+                entry_date=datetime.utcnow(),
+                status=True
+            )
+        )
+
+        conn.exec_driver_sql(
+            "COMMIT"
+        )
+
         return "lista_espera"
 
     except Exception:
-        conn.exec_driver_sql("ROLLBACK")
+
+        try:
+
+            conn.exec_driver_sql(
+                "ROLLBACK"
+            )
+
+        except Exception:
+            pass
+
         raise
+
     finally:
+
         conn.close()
 
 
-def inscribir_estudiante(usuario_id: int, grupo_id: int) -> str:
-    """
-    Inscribe a un estudiante en un grupo (RF-04 a RF-09).
-    Reintenta automáticamente si la base de datos está bloqueada por otra
-    inscripción concurrente sobre el mismo grupo (esto es lo que evita el
-    sobrecupo cuando muchos estudiantes se inscriben al mismo tiempo).
-    """
+# ============================================================
+# INSCRIBIR ESTUDIANTE
+# ============================================================
+
+def inscribir_estudiante(
+    usuario_id: int,
+    grupo_id: int
+) -> str:
+
     inicio = time.time()
     reintentos = 0
 
     while True:
+
         try:
-            resultado = _intentar_inscripcion(usuario_id, grupo_id)
-            tiempo_ms = (time.time() - inicio) * 1000
-            _registrar_metrica(grupo_id, resultado, tiempo_ms, reintentos)
+
+            resultado = _intentar_inscripcion(
+                usuario_id,
+                grupo_id
+            )
+
+            tiempo_ms = (
+                time.time() - inicio
+            ) * 1000
+
+            _registrar_metrica(
+                grupo_id,
+                resultado,
+                tiempo_ms,
+                reintentos
+            )
+
             return resultado
+
         except OperationalError as exc:
-            if "locked" in str(exc).lower() and reintentos < MAX_REINTENTOS:
+
+            texto = str(exc).lower()
+
+            bloqueado = any(
+                palabra in texto
+                for palabra in [
+                    "locked",
+                    "deadlock",
+                    "lock wait timeout"
+                ]
+            )
+
+            if (
+                bloqueado
+                and reintentos < MAX_REINTENTOS
+            ):
+
                 reintentos += 1
-                time.sleep(random.uniform(0.02, 0.08) * reintentos)  # backoff simple
+
+                time.sleep(
+                    random.uniform(
+                        0.02,
+                        0.08
+                    ) * reintentos
+                )
+
                 continue
-            tiempo_ms = (time.time() - inicio) * 1000
-            _registrar_metrica(grupo_id, "fallida", tiempo_ms, reintentos)
+
+            tiempo_ms = (
+                time.time() - inicio
+            ) * 1000
+
+            _registrar_metrica(
+                grupo_id,
+                "fallida",
+                tiempo_ms,
+                reintentos
+            )
+
             raise ErrorConcurrencia(
-                "No se pudo completar la inscripción por alta concurrencia. Intenta de nuevo."
+                "No se pudo completar la inscripción "
+                "por alta concurrencia. Intenta de nuevo."
             ) from exc
 
 
-def cancelar_inscripcion(usuario_id: int, grupo_id: int) -> bool:
-    """
-    Cancela una inscripción (RF-11) y asigna el cupo liberado al primer
-    estudiante de la lista de espera (RF-12), notificándolo (RF-13).
-    """
-    conn = engine.connect().execution_options(isolation_level="AUTOCOMMIT")
+# ============================================================
+# CANCELAR INSCRIPCIÓN
+# ============================================================
+
+def cancelar_inscripcion(
+    usuario_id: int,
+    grupo_id: int
+) -> bool:
+
+    conn = engine.connect()
+
     try:
-        _iniciar_transaccion_exclusiva(conn)
+
+        _iniciar_transaccion_exclusiva(
+            conn
+        )
 
         inscripcion = conn.execute(
-            select(Inscripcion.id).where(
-                Inscripcion.usuario_id == usuario_id,
-                Inscripcion.grupo_id == grupo_id,
-                Inscripcion.estado == "activa",
+
+            select(
+                Enrollment.enrollment_id
             )
+
+            .where(
+                Enrollment.student_id == usuario_id,
+                Enrollment.group_id == grupo_id,
+                Enrollment.status.is_(True)
+            )
+
         ).first()
+
         if not inscripcion:
-            conn.exec_driver_sql("COMMIT")
+
+            conn.exec_driver_sql(
+                "COMMIT"
+            )
+
             return False
 
+        # ----------------------------------------------------
+        # CANCELAR
+        # ----------------------------------------------------
+
         conn.execute(
-            update(Inscripcion).where(Inscripcion.id == inscripcion.id).values(estado="cancelada")
-        )
-        conn.execute(
-            update(Grupo).where(Grupo.id == grupo_id)
-            .values(cupos_ocupados=Grupo.cupos_ocupados - 1)
+
+            update(Enrollment)
+
+            .where(
+                Enrollment.enrollment_id
+                == inscripcion.enrollment_id
+            )
+
+            .values(
+                status=False
+            )
         )
 
+        # ----------------------------------------------------
+        # LIBERAR CUPO
+        # ----------------------------------------------------
+
+        conn.execute(
+
+            update(Group)
+
+            .where(
+                Group.group_id == grupo_id
+            )
+
+            .values(
+                current_capacity=
+                Group.current_capacity - 1
+            )
+        )
+
+        # ----------------------------------------------------
+        # SIGUIENTE EN ESPERA
+        # ----------------------------------------------------
+
         siguiente = conn.execute(
-            select(ListaEspera.id, ListaEspera.usuario_id)
-            .where(ListaEspera.grupo_id == grupo_id, ListaEspera.activo.is_(True))
-            .order_by(ListaEspera.fecha_ingreso.asc())
+
+            select(
+                Waitlist.waitlist_id,
+                Waitlist.student_id
+            )
+
+            .where(
+                Waitlist.group_id == grupo_id,
+                Waitlist.status.is_(True)
+            )
+
+            .order_by(
+                Waitlist.position.asc(),
+                Waitlist.entry_date.asc()
+            )
+
         ).first()
 
         if siguiente:
-            conn.execute(
-                update(ListaEspera).where(ListaEspera.id == siguiente.id).values(activo=False)
-            )
-            conn.execute(
-                update(Grupo).where(Grupo.id == grupo_id)
-                .values(cupos_ocupados=Grupo.cupos_ocupados + 1)
-            )
-            conn.execute(insert(Inscripcion).values(
-                usuario_id=siguiente.usuario_id, grupo_id=grupo_id,
-                estado="activa", fecha=datetime.utcnow(),
-            ))
-            grupo_info = conn.execute(
-                select(Grupo.materia, Grupo.grupo).where(Grupo.id == grupo_id)
-            ).first()
-            conn.execute(insert(Notificacion).values(
-                usuario_id=siguiente.usuario_id,
-                mensaje=f"Se te asignó un cupo en {grupo_info.materia} - Grupo {grupo_info.grupo}.",
-                leida=False, fecha=datetime.utcnow(),
-            ))
 
-        conn.exec_driver_sql("COMMIT")
+            conn.execute(
+
+                update(Waitlist)
+
+                .where(
+                    Waitlist.waitlist_id
+                    == siguiente.waitlist_id
+                )
+
+                .values(
+                    status=False
+                )
+            )
+
+            conn.execute(
+
+                update(Group)
+
+                .where(
+                    Group.group_id == grupo_id
+                )
+
+                .values(
+                    current_capacity=
+                    Group.current_capacity + 1
+                )
+            )
+
+            conn.execute(
+
+                insert(Enrollment)
+
+                .values(
+                    student_id=siguiente.student_id,
+                    group_id=grupo_id,
+                    enrollment_date=datetime.utcnow(),
+                    period="2026-2",
+                    status=True
+                )
+            )
+
+            grupo_info = conn.execute(
+
+                select(
+                    Subject.name,
+                    Group.group_id
+                )
+
+                .join(
+                    Group,
+                    Group.subject_id
+                    == Subject.subject_id
+                )
+
+                .where(
+                    Group.group_id == grupo_id
+                )
+
+            ).first()
+
+            if grupo_info:
+
+                mensaje = (
+                    f"Se te asignó un cupo en "
+                    f"{grupo_info.name} - "
+                    f"Grupo {grupo_info.group_id}."
+                )
+
+            else:
+
+                mensaje = (
+                    "Se te asignó un cupo "
+                    "en un grupo de tu lista de espera."
+                )
+
+            conn.execute(
+
+                insert(Notification)
+
+                .values(
+                    student_id=siguiente.student_id,
+                    message=mensaje,
+                    status=True
+                )
+            )
+
+        conn.exec_driver_sql(
+            "COMMIT"
+        )
+
         return True
+
     except Exception:
-        conn.exec_driver_sql("ROLLBACK")
+
+        try:
+
+            conn.exec_driver_sql(
+                "ROLLBACK"
+            )
+
+        except Exception:
+            pass
+
         raise
+
     finally:
+
         conn.close()
 
 
-# =============================================================================
-# CONSULTAS DEL ESTUDIANTE (pantalla "Mis inscripciones y lista de espera")
-# =============================================================================
+# ============================================================
+# MIS INSCRIPCIONES
+# ============================================================
 
-def listar_mis_inscripciones(usuario_id: int) -> list[dict]:
+def listar_mis_inscripciones(
+    usuario_id: int
+) -> list[dict]:
+
     with SessionLocal() as session:
+
         filas = session.execute(
-            select(Grupo.id, Grupo.materia, Grupo.grupo, Grupo.docente, Grupo.horario)
-            .join(Inscripcion, Inscripcion.grupo_id == Grupo.id)
-            .where(Inscripcion.usuario_id == usuario_id, Inscripcion.estado == "activa")
-            .order_by(Grupo.materia)
-        ).all()
-        return [dict(f._mapping) for f in filas]
 
+            select(
+                Group.group_id,
+                Subject.name.label("materia"),
+                Group.group_id.label("grupo"),
+                Teacher.name.label("docente"),
+                Teacher.last_name.label(
+                    "apellido_docente"
+                ),
+                Group.schedule.label(
+                    "horario"
+                )
+            )
 
-def listar_mi_lista_espera(usuario_id: int) -> list[dict]:
-    with SessionLocal() as session:
-        grupos_en_espera = session.execute(
-            select(ListaEspera.grupo_id, ListaEspera.fecha_ingreso)
-            .where(ListaEspera.usuario_id == usuario_id, ListaEspera.activo.is_(True))
+            .join(
+                Enrollment,
+                Enrollment.group_id
+                == Group.group_id
+            )
+
+            .join(
+                Subject,
+                Subject.subject_id
+                == Group.subject_id
+            )
+
+            .outerjoin(
+                Teacher,
+                Teacher.teacher_id
+                == Subject.teacher_id
+            )
+
+            .where(
+                Enrollment.student_id
+                == usuario_id,
+
+                Enrollment.status.is_(True)
+            )
+
+            .order_by(
+                Subject.name
+            )
+
         ).all()
 
         resultado = []
-        for grupo_id, fecha_ingreso in grupos_en_espera:
-            grupo = session.get(Grupo, grupo_id)
-            total_espera = session.scalar(
-                select(func.count(ListaEspera.id))
-                .where(ListaEspera.grupo_id == grupo_id, ListaEspera.activo.is_(True))
-            )
-            anteriores = session.scalar(
-                select(func.count(ListaEspera.id)).where(
-                    ListaEspera.grupo_id == grupo_id,
-                    ListaEspera.activo.is_(True),
-                    ListaEspera.fecha_ingreso < fecha_ingreso,
+
+        for fila in filas:
+
+            docente = fila.docente or "Sin docente"
+
+            if fila.apellido_docente:
+
+                docente = (
+                    f"{docente} "
+                    f"{fila.apellido_docente}"
                 )
-            )
+
             resultado.append({
-                "grupo_id": grupo_id, "materia": grupo.materia, "grupo": grupo.grupo,
-                "posicion": anteriores + 1, "total_en_espera": total_espera,
+
+                "id": fila.group_id,
+
+                "materia":
+                    fila.materia,
+
+                "grupo":
+                    fila.grupo,
+
+                "docente":
+                    docente,
+
+                "horario":
+                    fila.horario
             })
+
         return resultado
 
 
-def obtener_posicion_espera(usuario_id: int, grupo_id: int) -> Optional[int]:
-    for item in listar_mi_lista_espera(usuario_id):
-        if item["grupo_id"] == grupo_id:
-            return item["posicion"]
-    return None
+# ============================================================
+# LISTA DE ESPERA
+# ============================================================
 
+def listar_mi_lista_espera(
+    usuario_id: int
+) -> list[dict]:
 
-def listar_notificaciones(usuario_id: int, limite: int = 5) -> list[str]:
     with SessionLocal() as session:
-        mensajes = session.scalars(
-            select(Notificacion.mensaje)
-            .where(Notificacion.usuario_id == usuario_id)
-            .order_by(Notificacion.fecha.desc())
-            .limit(limite)
+
+        filas = session.execute(
+
+            select(
+                Waitlist.group_id,
+                Subject.name.label(
+                    "materia"
+                ),
+                Group.group_id.label(
+                    "grupo"
+                ),
+                Waitlist.position
+            )
+
+            .join(
+                Group,
+                Group.group_id
+                == Waitlist.group_id
+            )
+
+            .join(
+                Subject,
+                Subject.subject_id
+                == Group.subject_id
+            )
+
+            .where(
+                Waitlist.student_id
+                == usuario_id,
+
+                Waitlist.status.is_(True)
+            )
+
+            .order_by(
+                Waitlist.position.asc()
+            )
+
         ).all()
+
+        resultado = []
+
+        for fila in filas:
+
+            total = session.scalar(
+
+                select(
+                    func.count(
+                        Waitlist.waitlist_id
+                    )
+                )
+
+                .where(
+                    Waitlist.group_id
+                    == fila.group_id,
+
+                    Waitlist.status.is_(True)
+                )
+
+            ) or 0
+
+            resultado.append({
+
+                "grupo_id":
+                    fila.group_id,
+
+                "materia":
+                    fila.materia,
+
+                "grupo":
+                    fila.grupo,
+
+                "posicion":
+                    fila.position,
+
+                "total_en_espera":
+                    total
+            })
+
+        return resultado
+
+
+def obtener_posicion_espera(
+    usuario_id: int,
+    grupo_id: int
+) -> Optional[int]:
+
+    with SessionLocal() as session:
+
+        posicion = session.scalar(
+
+            select(
+                Waitlist.position
+            )
+
+            .where(
+
+                Waitlist.student_id
+                == usuario_id,
+
+                Waitlist.group_id
+                == grupo_id,
+
+                Waitlist.status.is_(True)
+            )
+
+        )
+
+        return posicion
+
+
+# ============================================================
+# NOTIFICACIONES
+# ============================================================
+
+def listar_notificaciones(
+    usuario_id: int,
+    limite: int = 5
+) -> list[str]:
+
+    with SessionLocal() as session:
+
+        mensajes = session.scalars(
+
+            select(
+                Notification.message
+            )
+
+            .where(
+
+                Notification.student_id
+                == usuario_id,
+
+                Notification.status.is_(True)
+            )
+
+            .order_by(
+                Notification.notification_id.desc()
+            )
+
+            .limit(limite)
+
+        ).all()
+
         return list(reversed(mensajes))
 
 
-# =============================================================================
-# PANEL DEL COORDINADOR (métricas y ocupación en tiempo real)
-# =============================================================================
+# ============================================================
+# MÉTRICAS
+# ============================================================
 
 def resumen_metricas() -> dict:
+
     with SessionLocal() as session:
-        tiempos = session.scalars(select(MetricaTransaccion.tiempo_respuesta_ms)).all()
+
+        tiempos = session.scalars(
+
+            select(
+                PerformanceMetric.response_time_ms
+            )
+
+            .where(
+                PerformanceMetric
+                .response_time_ms
+                .is_not(None)
+            )
+
+        ).all()
+
         fallidas = session.scalar(
-            select(func.count(MetricaTransaccion.id))
-            .where(MetricaTransaccion.resultado == "fallida")
-        ) or 0
-        reintentos = session.scalar(select(func.sum(MetricaTransaccion.reintentos))) or 0
-        return {"tiempos_ms": list(tiempos), "transacciones_fallidas": fallidas, "reintentos": reintentos}
 
-
-# =============================================================================
-# SIMULADOR DE CONCURRENCIA
-# =============================================================================
-
-def preparar_usuarios_simulados(cantidad: int) -> list[int]:
-    """Crea (si no existen) usuarios de prueba para el simulador y devuelve sus ids."""
-    with SessionLocal() as session:
-        ids = []
-        for i in range(1, cantidad + 1):
-            correo = f"sim{i}@demo.local"
-            usuario = session.scalar(select(Usuario).where(Usuario.correo == correo))
-            if usuario is None:
-                usuario = Usuario(
-                    correo=correo, password_hash=hash_password("simulacion"),
-                    nombre=f"Estudiante Simulado {i}", rol="estudiante",
+            select(
+                func.sum(
+                    PerformanceMetric
+                    .failed_transactions
                 )
-                session.add(usuario)
+            )
+
+        ) or 0
+
+        reintentos = session.scalar(
+
+            select(
+                func.sum(
+                    PerformanceMetric
+                    .retried_transactions
+                )
+            )
+
+        ) or 0
+
+        return {
+
+            "tiempos_ms":
+                list(tiempos),
+
+            "transacciones_fallidas":
+                int(fallidas),
+
+            "reintentos":
+                int(reintentos)
+        }
+
+
+# ============================================================
+# USUARIOS PARA SIMULACIÓN
+# ============================================================
+
+def preparar_usuarios_simulados(
+    cantidad: int
+) -> list[int]:
+
+    with SessionLocal() as session:
+
+        ids = []
+
+        for i in range(
+            1,
+            cantidad + 1
+        ):
+
+            correo = (
+                f"sim{i}@demo.local"
+            )
+
+            usuario = session.scalar(
+
+                select(Student)
+
+                .where(
+                    Student.email
+                    == correo
+                )
+
+            )
+
+            if usuario is None:
+
+                usuario = Student(
+
+                    code=f"SIM-{i}",
+
+                    name=(
+                        f"Estudiante "
+                        f"Simulado {i}"
+                    ),
+
+                    email=correo,
+
+                    password=
+                        hash_password(
+                            "simulacion"
+                        ),
+
+                    registration_date=
+                        datetime.utcnow(),
+
+                    status=True
+                )
+
+                session.add(
+                    usuario
+                )
+
                 session.flush()
-            ids.append(usuario.id)
+
+            ids.append(
+                usuario.student_id
+            )
+
         session.commit()
+
         return ids
 
 
-def reiniciar_estado_grupo_para_simulacion(grupo_id: int, usuario_ids: list[int]) -> None:
-    """
-    Antes de cada corrida del simulador, libera cualquier cupo o puesto en
-    lista de espera que los usuarios simulados tuvieran en ese grupo, para
-    poder repetir la prueba de manera consistente.
-    """
+# ============================================================
+# REINICIAR SIMULACIÓN
+# ============================================================
+
+def reiniciar_estado_grupo_para_simulacion(
+    grupo_id: int,
+    usuario_ids: list[int]
+) -> None:
+
     with SessionLocal() as session:
+
         inscripciones = session.scalars(
-            select(Inscripcion).where(
-                Inscripcion.grupo_id == grupo_id,
-                Inscripcion.usuario_id.in_(usuario_ids),
-                Inscripcion.estado == "activa",
+
+            select(Enrollment)
+
+            .where(
+
+                Enrollment.group_id
+                == grupo_id,
+
+                Enrollment.student_id
+                .in_(usuario_ids),
+
+                Enrollment.status.is_(True)
             )
+
         ).all()
-        liberados = len(inscripciones)
-        for insc in inscripciones:
-            insc.estado = "cancelada"
+
+        liberados = len(
+            inscripciones
+        )
+
+        for inscripcion in inscripciones:
+
+            inscripcion.status = False
 
         session.execute(
-            delete(ListaEspera).where(
-                ListaEspera.grupo_id == grupo_id,
-                ListaEspera.usuario_id.in_(usuario_ids),
+
+            update(Waitlist)
+
+            .where(
+
+                Waitlist.group_id
+                == grupo_id,
+
+                Waitlist.student_id
+                .in_(usuario_ids),
+
+                Waitlist.status.is_(True)
+            )
+
+            .values(
+                status=False
             )
         )
 
         if liberados:
-            grupo = session.get(Grupo, grupo_id)
-            grupo.cupos_ocupados = max(0, grupo.cupos_ocupados - liberados)
+
+            grupo = session.get(
+                Group,
+                grupo_id
+            )
+
+            if grupo:
+
+                grupo.current_capacity = max(
+                    0,
+                    grupo.current_capacity
+                    - liberados
+                )
 
         session.commit()
