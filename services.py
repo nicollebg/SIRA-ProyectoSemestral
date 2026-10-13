@@ -296,7 +296,6 @@ def _leer_grupo_bloqueado(
     conn,
     grupo_id: int
 ):
-
     consulta = (
         select(
             Group.group_id,
@@ -309,7 +308,6 @@ def _leer_grupo_bloqueado(
     )
 
     if engine.dialect.name != "sqlite":
-
         consulta = consulta.with_for_update()
 
     fila = conn.execute(
@@ -317,7 +315,6 @@ def _leer_grupo_bloqueado(
     ).first()
 
     if fila is None:
-
         raise ErrorValidacion(
             "El grupo seleccionado no existe."
         )
@@ -420,11 +417,11 @@ def _intentar_inscripcion(
         # ----------------------------------------------------
         # HAY CUPO
         # ----------------------------------------------------
-
-        if (
-            grupo.current_capacity
-            < grupo.maximum_capacity
-        ):
+        capacidad_maxima = grupo[1]
+        capacidad_actual = grupo[2]
+        
+    
+        if capacidad_actual < capacidad_maxima:
 
             conn.execute(
 
@@ -639,18 +636,16 @@ def cancelar_inscripcion(
         )
 
         inscripcion = conn.execute(
-
             select(
-                Enrollment.enrollment_id
+                Enrollment.enrollment_id.label("enrollment_id"),
+                Enrollment.group_id.label("group_id")
             )
-
             .where(
                 Enrollment.student_id == usuario_id,
                 Enrollment.group_id == grupo_id,
-                Enrollment.status.is_(True)
+                Enrollment.status == True
             )
-
-        ).first()
+        ).mappings().first()
 
         if not inscripcion:
 
@@ -670,7 +665,7 @@ def cancelar_inscripcion(
 
             .where(
                 Enrollment.enrollment_id
-                == inscripcion.enrollment_id
+                == inscripcion["enrollment_id"]
             )
 
             .values(
