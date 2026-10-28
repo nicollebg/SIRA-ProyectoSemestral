@@ -475,6 +475,9 @@ def main():
             if st.button("Simulador de concurrencia", use_container_width=True):
                 st.session_state.vista = "simulador"
                 st.rerun()
+            if st.button("Datos abiertos (Colombia)", use_container_width=True):
+                st.session_state.vista = "datos_abiertos"
+                st.rerun()
         st.divider()
         if st.button("Cerrar sesión", use_container_width=True):
             cerrar_sesion()
@@ -491,6 +494,9 @@ def main():
         pantalla_panel_coordinador()
     elif vista == "simulador":
         pantalla_simulador()
+    elif vista == "datos_abiertos":
+        from presentation.open_data_page import pantalla_datos_abiertos
+        pantalla_datos_abiertos()
     else:
         pantalla_catalogo()
 
